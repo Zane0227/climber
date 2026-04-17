@@ -189,11 +189,7 @@ function SliderControl({
         step={step}
         value={value}
         onChange={(e) => onChange(parseFloat(e.target.value))}
-        className="w-full h-1.5 bg-white/10 rounded-full appearance-none cursor-pointer
-          [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-4 [&::-webkit-slider-thumb]:h-4
-          [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:bg-emerald-400
-          [&::-webkit-slider-thumb]:shadow-[0_0_8px_rgba(52,211,153,0.4)]
-          [&::-webkit-slider-thumb]:cursor-pointer"
+        className="w-full"
       />
       {description && (
         <div className="text-xs text-white/30">{description}</div>

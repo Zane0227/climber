@@ -34,10 +34,34 @@ body {
 }
 
 /* range input 自定义 */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 20px;         /* 给足高度容纳 thumb，保证各行对齐 */
+  background: transparent;
+  margin: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
 input[type="range"]::-webkit-slider-runnable-track {
   background: rgba(255, 255, 255, 0.1);
   border-radius: 9999px;
   height: 6px;
+}
+
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #34d399;
+  border: none;
+  cursor: pointer;
+  box-shadow: 0 0 8px rgba(52, 211, 153, 0.4);
+  margin-top: -5px;     /* (6px track - 16px thumb) / 2 = -5px，垂直居中 */
 }
 
 input[type="range"]::-moz-range-track {
