@@ -1,5 +1,5 @@
-import ClientWrapper from "@/components/ClientWrapper";
+import ClimbingApp from "@/components/ClimbingApp";
 
-export default function HomePage() {
-  return <ClientWrapper />;
+export default function Home() {
+  return <ClimbingApp />;
 }

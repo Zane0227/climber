@@ -11,6 +11,8 @@
  */
 
 import { Muxer, ArrayBufferTarget } from "mp4-muxer";
+import { seekVideoFrame } from "./video-frames";
+import type { ExportAudio } from "./export-audio";
 
 export interface ExportConfig {
   width: number;
@@ -42,119 +44,6 @@ export const DEFAULT_EXPORT_CONFIG: ExportConfig = {
   fps: 30,
 };
 
-// 标准输出分辨率档位（短边像素数）
-const RESOLUTION_TIERS = [
-  { label: "4K", shortEdge: 2160, bitrate: 20_000_000 },
-  { label: "1440p", shortEdge: 1440, bitrate: 12_000_000 },
-  { label: "1080p", shortEdge: 1080, bitrate: 8_000_000 },
-  { label: "720p", shortEdge: 720, bitrate: 5_000_000 },
-  { label: "540p", shortEdge: 540, bitrate: 3_000_000 },
-];
-
-export interface ExportPreset {
-  label: string;
-  shortEdge: number;
-  bitrate: number;
-  /** 是否为推荐选项（最接近实际有效分辨率） */
-  recommended?: boolean;
-  /** 相对于有效分辨率是放大还是缩小 */
-  quality: "native" | "upscale" | "downscale";
-}
-
-/**
- * 根据源视频尺寸和平均 viewport 计算实际有效分辨率（裁切区域的真实像素数）
- * viewport 的 width/height 是归一化的 0~1，代表裁切占源视频的比例
- */
-export function computeEffectiveResolution(
-  sourceWidth: number,
-  sourceHeight: number,
-  avgViewportWidth: number,
-  avgViewportHeight: number,
-): { effectiveWidth: number; effectiveHeight: number; effectiveShortEdge: number } {
-  const effectiveWidth = Math.round(sourceWidth * avgViewportWidth);
-  const effectiveHeight = Math.round(sourceHeight * avgViewportHeight);
-  const effectiveShortEdge = Math.min(effectiveWidth, effectiveHeight);
-  return { effectiveWidth, effectiveHeight, effectiveShortEdge };
-}
-
-/**
- * 根据实际有效分辨率，生成智能输出预设列表
- * - 只保留不超过有效分辨率太多的档位（允许最多高一档，标记为 upscale）
- * - 最接近有效分辨率的档位标记为推荐
- */
-export function buildSmartPresets(effectiveShortEdge: number): ExportPreset[] {
-  const presets: ExportPreset[] = [];
-
-  for (const tier of RESOLUTION_TIERS) {
-    const ratio = tier.shortEdge / effectiveShortEdge;
-
-    if (ratio > 1.3) {
-      // 超过有效分辨率 30% 以上，放大太多没意义，跳过
-      continue;
-    }
-
-    let quality: ExportPreset["quality"];
-    if (ratio > 1.05) {
-      quality = "upscale";
-    } else if (ratio < 0.95) {
-      quality = "downscale";
-    } else {
-      quality = "native";
-    }
-
-    presets.push({
-      ...tier,
-      quality,
-    });
-  }
-
-  // 如果一个都没有（有效分辨率极低），至少保留最低档
-  if (presets.length === 0) {
-    const lowest = RESOLUTION_TIERS[RESOLUTION_TIERS.length - 1];
-    presets.push({ ...lowest, quality: "upscale" });
-  }
-
-  // 找最接近有效分辨率的档位标记为推荐
-  let bestIdx = 0;
-  let bestDiff = Infinity;
-  for (let i = 0; i < presets.length; i++) {
-    const diff = Math.abs(presets[i].shortEdge - effectiveShortEdge);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      bestIdx = i;
-    }
-  }
-  presets[bestIdx].recommended = true;
-
-  return presets;
-}
-
-/**
- * 根据源视频尺寸和短边分辨率计算导出宽高
- * 保持源视频的原始宽高比
- */
-export function computeExportDimensions(
-  sourceWidth: number,
-  sourceHeight: number,
-  shortEdge: number,
-): { width: number; height: number } {
-  const ar = sourceWidth / sourceHeight;
-  let w: number, h: number;
-  if (ar >= 1) {
-    // 横版或正方形：短边是高度
-    h = shortEdge;
-    w = Math.round(h * ar);
-  } else {
-    // 竖版：短边是宽度
-    w = shortEdge;
-    h = Math.round(w / ar);
-  }
-  // 确保偶数（视频编码器要求）
-  w = w % 2 === 0 ? w : w + 1;
-  h = h % 2 === 0 ? h : h + 1;
-  return { width: w, height: h };
-}
-
 // =========== 编码后端（WebCodecs + mp4-muxer）===========
 
 /**
@@ -165,11 +54,11 @@ interface EncoderBackend {
   /** 编码一帧（canvas 当前内容） */
   encodeFrame(canvas: HTMLCanvasElement, frameIndex: number, isKeyFrame: boolean): void;
   /** 取消并关闭编码器 */
-  cancel(): void;
+  close(): void;
   /** 检查是否有编码错误 */
   checkError(): void;
   /** 完成编码，返回 Blob URL */
-  finalize(): Promise<string>;
+  finalize(signal?: AbortSignal): Promise<string>;
 }
 
 /** 创建 WebCodecs 编码后端 (MP4) */
@@ -178,6 +67,7 @@ function createWebCodecsBackend(
   height: number,
   fps: number,
   bitrate: number,
+  audio?: ExportAudio,
 ): EncoderBackend {
   // 精确计算每帧时长（微秒），使用整数运算避免浮点漂移
   const frameDurationUs = Math.round(1_000_000 / fps);
@@ -185,10 +75,13 @@ function createWebCodecsBackend(
   const muxer = new Muxer({
     target: new ArrayBufferTarget(),
     video: { codec: "avc", width, height },
+    audio: audio && {
+      codec: audio.codec,
+      sampleRate: audio.decoderConfig.sampleRate,
+      numberOfChannels: audio.decoderConfig.numberOfChannels,
+    },
     fastStart: "in-memory",
-    // "strict" 要求时间戳从 0 开始且单调递增，生成更规范的 MP4
-    // QuickTime (Mac) 对 MP4 合规性要求严格，offset 模式容易出问题
-    firstTimestampBehavior: "strict",
+    firstTimestampBehavior: audio ? "cross-track-offset" : "strict",
   });
 
   let encoderError: Error | null = null;
@@ -223,13 +116,12 @@ function createWebCodecsBackend(
     `[VideoExporter] 分辨率 ${width}×${height} (${codedArea}px²), 使用 codec: ${avcLevel}`,
   );
 
-  videoEncoder.configure({
-    codec: avcLevel,
-    width,
-    height,
-    bitrate,
-    framerate: fps,
-  });
+  try {
+    videoEncoder.configure({ codec: avcLevel, width, height, bitrate, framerate: fps });
+  } catch (error) {
+    if (videoEncoder.state !== "closed") videoEncoder.close();
+    throw error;
+  }
 
   return {
     encodeFrame(canvas, frameIndex, isKeyFrame) {
@@ -239,18 +131,29 @@ function createWebCodecsBackend(
         timestamp: timestampUs,
         duration: frameDurationUs,
       });
-      videoEncoder.encode(frame, { keyFrame: isKeyFrame });
-      frame.close();
+      try {
+        videoEncoder.encode(frame, { keyFrame: isKeyFrame });
+      } finally {
+        frame.close();
+      }
     },
-    cancel() {
-      videoEncoder.close();
+    close() {
+      if (videoEncoder.state !== "closed") videoEncoder.close();
     },
     checkError() {
       if (encoderError) throw encoderError;
     },
-    async finalize() {
+    async finalize(signal) {
       await videoEncoder.flush();
-      videoEncoder.close();
+      signal?.throwIfAborted();
+      if (audio) {
+        let metadata: EncodedAudioChunkMetadata | undefined = { decoderConfig: audio.decoderConfig };
+        for await (const packet of audio.packets) {
+          signal?.throwIfAborted();
+          muxer.addAudioChunkRaw(packet.data, "key", packet.timestamp, packet.duration, metadata);
+          metadata = undefined;
+        }
+      }
       muxer.finalize();
       const { buffer } = muxer.target as ArrayBufferTarget;
       const blob = new Blob([buffer], { type: "video/mp4" });
@@ -265,11 +168,11 @@ function createWebCodecsBackend(
  * 需要安全上下文（HTTPS 或 localhost）
  */
 function createEncoder(
-  _canvas: HTMLCanvasElement,
   width: number,
   height: number,
   fps: number,
   bitrate: number,
+  audio?: ExportAudio,
 ): EncoderBackend {
   if (typeof VideoEncoder !== "function" || typeof VideoFrame !== "function") {
     throw new Error(
@@ -277,7 +180,7 @@ function createEncoder(
     );
   }
   console.log("[VideoExporter] 使用 WebCodecs 编码后端 (MP4)");
-  return createWebCodecsBackend(width, height, fps, bitrate);
+  return createWebCodecsBackend(width, height, fps, bitrate, audio);
 }
 
 /** AI 推理频率 (每秒多少帧做推理，其余帧插值) */
@@ -573,79 +476,6 @@ function smoothKeyframes(
 }
 
 /**
- * 估算视频帧率
- * 使用 requestVideoFrameCallback（如果支持）或 fallback 为 30fps
- */
-export async function estimateVideoFps(video: HTMLVideoElement): Promise<number> {
-  // 如果浏览器支持 requestVideoFrameCallback，用它来精确测量
-  if ("requestVideoFrameCallback" in video) {
-    return new Promise<number>((resolve) => {
-      const timestamps: number[] = [];
-      const sampleCount = 10;
-      let count = 0;
-
-      const wasPlaying = !video.paused;
-      const savedTime = video.currentTime;
-
-      // 临时静音播放来采集帧时间
-      video.muted = true;
-      video.currentTime = 0;
-
-      const onFrame = (_now: number, metadata: { mediaTime: number }) => {
-        timestamps.push(metadata.mediaTime);
-        count++;
-        if (count < sampleCount + 1) {
-          (video as HTMLVideoElement & { requestVideoFrameCallback: (cb: typeof onFrame) => void }).requestVideoFrameCallback(onFrame);
-        } else {
-          video.pause();
-          video.currentTime = savedTime;
-          if (wasPlaying) video.play();
-
-          // 计算平均帧间隔
-          const intervals: number[] = [];
-          for (let i = 1; i < timestamps.length; i++) {
-            const diff = timestamps[i] - timestamps[i - 1];
-            if (diff > 0) intervals.push(diff);
-          }
-          if (intervals.length > 0) {
-            const avg = intervals.reduce((a, b) => a + b, 0) / intervals.length;
-            const fps = Math.round(1 / avg);
-            // 取最接近的常见帧率
-            resolve(snapToCommonFps(fps));
-          } else {
-            resolve(30);
-          }
-        }
-      };
-
-      (video as HTMLVideoElement & { requestVideoFrameCallback: (cb: typeof onFrame) => void }).requestVideoFrameCallback(onFrame);
-      video.play().catch(() => resolve(30));
-
-      // 超时保护
-      setTimeout(() => resolve(30), 3000);
-    });
-  }
-
-  // Fallback: 默认 30fps
-  return 30;
-}
-
-/** 将帧率对齐到常见帧率 */
-function snapToCommonFps(fps: number): number {
-  const common = [24, 25, 30, 48, 50, 60, 120];
-  let best = 30;
-  let bestDiff = Infinity;
-  for (const c of common) {
-    const diff = Math.abs(fps - c);
-    if (diff < bestDiff) {
-      bestDiff = diff;
-      best = c;
-    }
-  }
-  return best;
-}
-
-/**
  * 导出跟踪后的视频
  *
  * 核心优化：
@@ -669,7 +499,9 @@ export async function exportTrackedVideo(
   config: ExportConfig = DEFAULT_EXPORT_CONFIG,
   onProgress?: (progress: ExportProgress) => void,
   abortSignal?: AbortSignal,
+  audio?: ExportAudio,
 ): Promise<string> {
+  abortSignal?.throwIfAborted();
   const report = (p: ExportProgress) => onProgress?.(p);
 
   report({
@@ -685,158 +517,155 @@ export async function exportTrackedVideo(
   const ctx = canvas.getContext("2d")!;
 
   // =========== 编码后端（WebCodecs + mp4-muxer）===========
-  const encoder = createEncoder(canvas, config.width, config.height, config.fps, config.videoBitrate);
+  const encoder = createEncoder(config.width, config.height, config.fps, config.videoBitrate, audio);
 
-  // =========== 阶段1：预扫描关键帧视口（AI 推理降频）===========
-  report({
-    phase: "scanning",
-    progress: 0,
-    message: "正在预扫描视口...",
-  });
-
-  video.pause();
-  video.currentTime = trimStart;
-  await waitForSeek(video);
-
-  const totalDuration = trimEnd - trimStart;
-  const aiInterval = 1 / AI_INFERENCE_FPS; // AI 推理间隔(秒)
-  const keyframes: { time: number; viewport: Viewport }[] = [];
-
-  // 仅在 AI 采样点做推理
-  let scanTime = trimStart;
-  while (scanTime <= trimEnd + aiInterval * 0.5) {
-    if (abortSignal?.aborted) throw new Error("导出已取消");
-
-    const t = Math.min(scanTime, trimEnd);
-    video.currentTime = t;
-    await waitForSeek(video);
-    await waitForFrame(video);
-
-    const result = await processFrame(video);
-    keyframes.push({ time: t, viewport: result.viewport });
-
-    const elapsed = t - trimStart;
+  const closeEncoder = () => encoder.close();
+  abortSignal?.addEventListener("abort", closeEncoder, { once: true });
+  try {
+    // =========== 阶段1：预扫描关键帧视口（AI 推理降频）===========
     report({
       phase: "scanning",
-      progress: Math.min(0.45, (elapsed / totalDuration) * 0.45),
-      message: `预扫描中 ${((elapsed / totalDuration) * 100).toFixed(0)}%`,
-      currentTime: elapsed,
-      duration: totalDuration,
+      progress: 0,
+      message: "正在预扫描视口...",
     });
 
-    scanTime += aiInterval;
-    // 让主线程喘息
-    if (keyframes.length % 3 === 0) await sleep(0);
-  }
+    video.pause();
 
-  // 确保最后一帧有关键帧
-  if (keyframes.length > 0 && keyframes[keyframes.length - 1].time < trimEnd) {
-    video.currentTime = trimEnd;
-    await waitForSeek(video);
-    await waitForFrame(video);
-    const result = await processFrame(video);
-    keyframes.push({ time: trimEnd, viewport: result.viewport });
-  }
+    const totalDuration = trimEnd - trimStart;
+    const aiInterval = 1 / AI_INFERENCE_FPS; // AI 推理间隔(秒)
+    const keyframes: { time: number; viewport: Viewport }[] = [];
 
-  // 对关键帧序列做全局智能视口规划
-  // 包含：运动自适应平滑 + 前瞻预判 + 速度/加速度限制
-  const smoothedKeyframes = planViewportsGlobally(keyframes);
+    // 仅在 AI 采样点做推理
+    let scanTime = trimStart;
+    while (scanTime <= trimEnd + aiInterval * 0.5) {
+      abortSignal?.throwIfAborted();
 
-  // =========== 阶段2：逐帧绘制（用插值视口）===========
-  const frameInterval = 1 / config.fps;
-  // 用精确帧数控制循环，避免浮点累加漂移导致多编码帧
-  const totalFrames = Math.round(totalDuration * config.fps);
+      const t = Math.min(scanTime, trimEnd);
+      await seekVideoFrame(video, t, abortSignal);
 
-  video.currentTime = trimStart;
-  await waitForSeek(video);
+      const result = await processFrame(video);
+      abortSignal?.throwIfAborted();
+      keyframes.push({ time: t, viewport: result.viewport });
 
-  report({
-    phase: "encoding",
-    progress: 0.45,
-    message: "正在编码视频...",
-    currentTime: 0,
-    duration: totalDuration,
-  });
+      const elapsed = t - trimStart;
+      report({
+        phase: "scanning",
+        progress: Math.min(0.45, (elapsed / totalDuration) * 0.45),
+        message: `预扫描中 ${((elapsed / totalDuration) * 100).toFixed(0)}%`,
+        currentTime: elapsed,
+        duration: totalDuration,
+      });
 
-  let kfIdx = 0; // 当前关键帧索引
-
-  for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
-    if (abortSignal?.aborted) {
-      encoder.cancel();
-      throw new Error("导出已取消");
-    }
-    encoder.checkError();
-
-    // 通过帧序号精确计算当前时间点，避免浮点累加误差
-    const currentExportTime = trimStart + frameIndex * frameInterval;
-
-    // Seek 到目标帧
-    video.currentTime = currentExportTime;
-    await waitForSeek(video);
-    await waitForFrame(video);
-
-    // 通过关键帧插值获取视口（不再每帧跑AI）
-    while (kfIdx < smoothedKeyframes.length - 2 && smoothedKeyframes[kfIdx + 1].time < currentExportTime) {
-      kfIdx++;
-    }
-    let vp: Viewport;
-    if (kfIdx >= smoothedKeyframes.length - 1) {
-      vp = smoothedKeyframes[smoothedKeyframes.length - 1].viewport;
-    } else {
-      const kf0 = smoothedKeyframes[kfIdx];
-      const kf1 = smoothedKeyframes[kfIdx + 1];
-      const segDuration = kf1.time - kf0.time;
-      const t = segDuration > 0 ? (currentExportTime - kf0.time) / segDuration : 0;
-      vp = lerpViewport(kf0.viewport, kf1.viewport, Math.max(0, Math.min(1, t)));
+      scanTime += aiInterval;
+      // 让主线程喘息
+      if (keyframes.length % 3 === 0) await sleep(0);
     }
 
-    // 绘制裁剪画面到 canvas
-    const sx = vp.x * video.videoWidth;
-    const sy = vp.y * video.videoHeight;
-    const sw = vp.width * video.videoWidth;
-    const sh = vp.height * video.videoHeight;
+    // 确保最后一帧有关键帧
+    if (keyframes.length > 0 && keyframes[keyframes.length - 1].time < trimEnd) {
+      await seekVideoFrame(video, trimEnd, abortSignal);
+      const result = await processFrame(video);
+      abortSignal?.throwIfAborted();
+      keyframes.push({ time: trimEnd, viewport: result.viewport });
+    }
 
-    ctx.clearRect(0, 0, config.width, config.height);
-    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, config.width, config.height);
+    // 对关键帧序列做全局智能视口规划
+    // 包含：运动自适应平滑 + 前瞻预判 + 速度/加速度限制
+    const smoothedKeyframes = planViewportsGlobally(keyframes);
 
-    // 通过编码后端编码当前帧
-    const isKeyFrame = frameIndex % (config.fps * 2) === 0;
-    encoder.encodeFrame(canvas, frameIndex, isKeyFrame);
+    // =========== 阶段2：逐帧绘制（用插值视口）===========
+    const frameInterval = 1 / config.fps;
+    // 用精确帧数控制循环，避免浮点累加漂移导致多编码帧
+    const totalFrames = Math.round(totalDuration * config.fps);
 
-    // 更新进度
-    const elapsed = currentExportTime - trimStart;
-    const progress = 0.45 + Math.min(0.5, (elapsed / totalDuration) * 0.5);
 
     report({
       phase: "encoding",
-      progress,
-      message: `编码中 ${(progress * 100).toFixed(1)}%`,
-      currentTime: elapsed,
+      progress: 0.45,
+      message: "正在编码视频...",
+      currentTime: 0,
       duration: totalDuration,
     });
 
-    // 给主线程喘息机会（每3帧一次）
-    if (frameIndex % 3 === 0) {
-      await sleep(0);
+    let kfIdx = 0; // 当前关键帧索引
+
+    for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
+      abortSignal?.throwIfAborted();
+      encoder.checkError();
+
+      // 通过帧序号精确计算当前时间点，避免浮点累加误差
+      const currentExportTime = trimStart + frameIndex * frameInterval;
+
+      // Seek 到目标帧
+      await seekVideoFrame(video, currentExportTime, abortSignal);
+
+      // 通过关键帧插值获取视口（不再每帧跑AI）
+      while (kfIdx < smoothedKeyframes.length - 2 && smoothedKeyframes[kfIdx + 1].time < currentExportTime) {
+        kfIdx++;
+      }
+      let vp: Viewport;
+      if (kfIdx >= smoothedKeyframes.length - 1) {
+        vp = smoothedKeyframes[smoothedKeyframes.length - 1].viewport;
+      } else {
+        const kf0 = smoothedKeyframes[kfIdx];
+        const kf1 = smoothedKeyframes[kfIdx + 1];
+        const segDuration = kf1.time - kf0.time;
+        const t = segDuration > 0 ? (currentExportTime - kf0.time) / segDuration : 0;
+        vp = lerpViewport(kf0.viewport, kf1.viewport, Math.max(0, Math.min(1, t)));
+      }
+
+      // 绘制裁剪画面到 canvas
+      const sx = vp.x * video.videoWidth;
+      const sy = vp.y * video.videoHeight;
+      const sw = vp.width * video.videoWidth;
+      const sh = vp.height * video.videoHeight;
+
+      ctx.clearRect(0, 0, config.width, config.height);
+      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, config.width, config.height);
+
+      // 通过编码后端编码当前帧
+      const isKeyFrame = frameIndex % (config.fps * 2) === 0;
+      encoder.encodeFrame(canvas, frameIndex, isKeyFrame);
+
+      // 更新进度
+      const elapsed = currentExportTime - trimStart;
+      const progress = 0.45 + Math.min(0.5, (elapsed / totalDuration) * 0.5);
+
+      report({
+        phase: "encoding",
+        progress,
+        message: `编码中 ${(progress * 100).toFixed(1)}%`,
+        currentTime: elapsed,
+        duration: totalDuration,
+      });
+
+      // 给主线程喘息机会（每3帧一次）
+      if (frameIndex % 3 === 0) {
+        await sleep(0);
+      }
     }
+
+    // 完成编码和封装
+    report({
+      phase: "finalizing",
+      progress: 0.95,
+      message: "正在合成视频文件...",
+    });
+
+    abortSignal?.throwIfAborted();
+    const url = await encoder.finalize(abortSignal);
+
+    report({
+      phase: "done",
+      progress: 1,
+      message: "导出完成！",
+    });
+
+    return url;
+  } finally {
+    abortSignal?.removeEventListener("abort", closeEncoder);
+    closeEncoder();
   }
-
-  // 完成编码和封装
-  report({
-    phase: "finalizing",
-    progress: 0.95,
-    message: "正在合成视频文件...",
-  });
-
-  const url = await encoder.finalize();
-
-  report({
-    phase: "done",
-    progress: 1,
-    message: "导出完成！",
-  });
-
-  return url;
 }
 
 // =========== 调试视频导出 ===========
@@ -977,7 +806,9 @@ export async function exportDebugVideo(
   config: ExportConfig = DEFAULT_EXPORT_CONFIG,
   onProgress?: (progress: ExportProgress) => void,
   abortSignal?: AbortSignal,
+  audio?: ExportAudio,
 ): Promise<string> {
+  abortSignal?.throwIfAborted();
   const report = (p: ExportProgress) => onProgress?.(p);
 
   report({
@@ -1072,263 +903,232 @@ export async function exportDebugVideo(
   // 初始化编码后端（WebCodecs + mp4-muxer）
   const areaRatio = (finalW * finalH) / (config.width * config.height);
   const adjustedBitrate = Math.round(config.videoBitrate * areaRatio * 1.2);
-  const encoder = createEncoder(canvas, finalW, finalH, config.fps, adjustedBitrate);
+  const encoder = createEncoder(finalW, finalH, config.fps, adjustedBitrate, audio);
 
-  // =========== 阶段1：预扫描关键帧 ===========
-  report({
-    phase: "scanning",
-    progress: 0,
-    message: "预扫描视口和人体数据...",
-  });
-
-  video.pause();
-  video.currentTime = trimStart;
-  await waitForSeek(video);
-
-  const totalDuration = trimEnd - trimStart;
-  const aiInterval = 1 / AI_INFERENCE_FPS;
-  const debugKeyframes: DebugKeyframe[] = [];
-
-  let scanTime = trimStart;
-  while (scanTime <= trimEnd + aiInterval * 0.5) {
-    if (abortSignal?.aborted) throw new Error("导出已取消");
-
-    const t = Math.min(scanTime, trimEnd);
-    video.currentTime = t;
-    await waitForSeek(video);
-    await waitForFrame(video);
-
-    const result = await processFrame(video);
-    debugKeyframes.push({
-      time: t,
-      viewport: result.viewport,
-      person: result.person,
-    });
-
-    const elapsed = t - trimStart;
+  const closeEncoder = () => encoder.close();
+  abortSignal?.addEventListener("abort", closeEncoder, { once: true });
+  try {
+    // =========== 阶段1：预扫描关键帧 ===========
     report({
       phase: "scanning",
-      progress: Math.min(0.45, (elapsed / totalDuration) * 0.45),
-      message: `预扫描中 ${((elapsed / totalDuration) * 100).toFixed(0)}%`,
-      currentTime: elapsed,
-      duration: totalDuration,
+      progress: 0,
+      message: "预扫描视口和人体数据...",
     });
 
-    scanTime += aiInterval;
-    if (debugKeyframes.length % 3 === 0) await sleep(0);
-  }
+    video.pause();
 
-  // 确保最后一帧
-  if (debugKeyframes.length > 0 && debugKeyframes[debugKeyframes.length - 1].time < trimEnd) {
-    video.currentTime = trimEnd;
-    await waitForSeek(video);
-    await waitForFrame(video);
-    const result = await processFrame(video);
-    debugKeyframes.push({ time: trimEnd, viewport: result.viewport, person: result.person });
-  }
+    const totalDuration = trimEnd - trimStart;
+    const aiInterval = 1 / AI_INFERENCE_FPS;
+    const debugKeyframes: DebugKeyframe[] = [];
 
-  // 对视口做全局智能规划
-  const viewportOnly = debugKeyframes.map((kf) => ({ time: kf.time, viewport: kf.viewport }));
-  const smoothedViewports = planViewportsGlobally(viewportOnly);
+    let scanTime = trimStart;
+    while (scanTime <= trimEnd + aiInterval * 0.5) {
+      abortSignal?.throwIfAborted();
 
-  // 将平滑后的视口合并回 debugKeyframes
-  for (let i = 0; i < debugKeyframes.length; i++) {
-    if (i < smoothedViewports.length) {
-      debugKeyframes[i].viewport = smoothedViewports[i].viewport;
-    }
-  }
+      const t = Math.min(scanTime, trimEnd);
+      await seekVideoFrame(video, t, abortSignal);
 
-  // =========== 阶段2：逐帧绘制 ===========
-  const frameInterval = 1 / config.fps;
-  // 用精确帧数控制循环，避免浮点累加漂移导致多编码帧
-  const totalFrames = Math.round(totalDuration * config.fps);
+      const result = await processFrame(video);
+      abortSignal?.throwIfAborted();
+      debugKeyframes.push({
+        time: t,
+        viewport: result.viewport,
+        person: result.person,
+      });
 
-  video.currentTime = trimStart;
-  await waitForSeek(video);
+      const elapsed = t - trimStart;
+      report({
+        phase: "scanning",
+        progress: Math.min(0.45, (elapsed / totalDuration) * 0.45),
+        message: `预扫描中 ${((elapsed / totalDuration) * 100).toFixed(0)}%`,
+        currentTime: elapsed,
+        duration: totalDuration,
+      });
 
-  report({
-    phase: "encoding",
-    progress: 0.45,
-    message: "正在编码调试视频...",
-    currentTime: 0,
-    duration: totalDuration,
-  });
-
-  let kfIdx = 0;
-
-  for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
-    if (abortSignal?.aborted) {
-      encoder.cancel();
-      throw new Error("导出已取消");
-    }
-    encoder.checkError();
-
-    // 通过帧序号精确计算当前时间点，避免浮点累加误差
-    const currentExportTime = trimStart + frameIndex * frameInterval;
-
-    video.currentTime = currentExportTime;
-    await waitForSeek(video);
-    await waitForFrame(video);
-
-    // 查找最近的关键帧并插值
-    while (kfIdx < debugKeyframes.length - 2 && debugKeyframes[kfIdx + 1].time < currentExportTime) {
-      kfIdx++;
+      scanTime += aiInterval;
+      if (debugKeyframes.length % 3 === 0) await sleep(0);
     }
 
-    let vp: Viewport;
-    let person: DebugKeyframe["person"];
-
-    if (kfIdx >= debugKeyframes.length - 1) {
-      vp = debugKeyframes[debugKeyframes.length - 1].viewport;
-      person = debugKeyframes[debugKeyframes.length - 1].person;
-    } else {
-      const kf0 = debugKeyframes[kfIdx];
-      const kf1 = debugKeyframes[kfIdx + 1];
-      const segDuration = kf1.time - kf0.time;
-      const t = segDuration > 0 ? (currentExportTime - kf0.time) / segDuration : 0;
-      const clampedT = Math.max(0, Math.min(1, t));
-      vp = lerpViewport(kf0.viewport, kf1.viewport, clampedT);
-      // person 取最近的关键帧
-      person = clampedT < 0.5 ? kf0.person : kf1.person;
+    // 确保最后一帧
+    if (debugKeyframes.length > 0 && debugKeyframes[debugKeyframes.length - 1].time < trimEnd) {
+      await seekVideoFrame(video, trimEnd, abortSignal);
+      const result = await processFrame(video);
+      abortSignal?.throwIfAborted();
+      debugKeyframes.push({ time: trimEnd, viewport: result.viewport, person: result.person });
     }
 
-    // 清空画布（黑色背景）
-    ctx.fillStyle = "#000000";
-    ctx.fillRect(0, 0, finalW, finalH);
+    // 对视口做全局智能规划
+    const viewportOnly = debugKeyframes.map((kf) => ({ time: kf.time, viewport: kf.viewport }));
+    const smoothedViewports = planViewportsGlobally(viewportOnly);
 
-    const sx = vp.x * vw;
-    const sy = vp.y * vh;
-    const sw = vp.width * vw;
-    const sh = vp.height * vh;
-
-    if (isLandscape) {
-      // ===== 横屏：上下排列 =====
-      // ---- 上方：裁剪后的输出画面 ----
-      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, topW, topH);
-
-      // "OUTPUT" 标签
-      ctx.fillStyle = "rgba(0,0,0,0.5)";
-      ctx.fillRect(0, 0, Math.round(topW * 0.12), Math.round(topH * 0.05));
-      ctx.fillStyle = "#00ff88";
-      ctx.font = `bold ${Math.round(topH * 0.03)}px monospace`;
-      ctx.fillText("OUTPUT", 6, Math.round(topH * 0.035));
-
-      // ---- 中间分割线 ----
-      ctx.fillStyle = "#333333";
-      ctx.fillRect(0, topH, finalW, gap);
-
-      // ---- 下方：全景调试视图 ----
-      const debugY = topH + gap;
-      ctx.drawImage(video, 0, 0, vw, vh, 0, debugY, bottomW, bottomH);
-
-      // 在下方画布区域绘制调试叠加层
-      ctx.save();
-      ctx.translate(0, debugY);
-      drawDebugOverlay(ctx, bottomW, bottomH, vw, vh, vp, person, currentExportTime);
-      ctx.restore();
-
-      // "DEBUG" 标签
-      ctx.fillStyle = "rgba(0,0,0,0.5)";
-      ctx.fillRect(0, debugY, Math.round(bottomW * 0.1), Math.round(bottomH * 0.06));
-      ctx.fillStyle = "#ff6600";
-      ctx.font = `bold ${Math.round(bottomH * 0.035)}px monospace`;
-      ctx.fillText("DEBUG", 6, debugY + Math.round(bottomH * 0.04));
-    } else {
-      // ===== 竖屏：左右并排 =====
-      // ---- 左侧：裁剪后的输出画面 ----
-      ctx.drawImage(video, sx, sy, sw, sh, 0, 0, topW, topH);
-
-      // "OUTPUT" 标签
-      ctx.fillStyle = "rgba(0,0,0,0.5)";
-      ctx.fillRect(0, 0, Math.round(topW * 0.18), Math.round(topH * 0.035));
-      ctx.fillStyle = "#00ff88";
-      ctx.font = `bold ${Math.round(topH * 0.022)}px monospace`;
-      ctx.fillText("OUTPUT", 6, Math.round(topH * 0.025));
-
-      // ---- 中间分割线 ----
-      ctx.fillStyle = "#333333";
-      ctx.fillRect(topW, 0, gap, finalH);
-
-      // ---- 右侧：全景调试视图 ----
-      const rightX = topW + gap;
-      ctx.drawImage(video, 0, 0, vw, vh, rightX, 0, bottomW, bottomH);
-
-      // 在右侧画布区域绘制调试叠加层
-      ctx.save();
-      ctx.translate(rightX, 0);
-      drawDebugOverlay(ctx, bottomW, bottomH, vw, vh, vp, person, currentExportTime);
-      ctx.restore();
-
-      // "DEBUG" 标签
-      ctx.fillStyle = "rgba(0,0,0,0.5)";
-      ctx.fillRect(rightX, 0, Math.round(bottomW * 0.15), Math.round(bottomH * 0.035));
-      ctx.fillStyle = "#ff6600";
-      ctx.font = `bold ${Math.round(bottomH * 0.022)}px monospace`;
-      ctx.fillText("DEBUG", rightX + 6, Math.round(bottomH * 0.025));
+    // 将平滑后的视口合并回 debugKeyframes
+    for (let i = 0; i < debugKeyframes.length; i++) {
+      if (i < smoothedViewports.length) {
+        debugKeyframes[i].viewport = smoothedViewports[i].viewport;
+      }
     }
 
-    // 通过编码后端编码当前帧
-    const isKeyFrame = frameIndex % (config.fps * 2) === 0;
-    encoder.encodeFrame(canvas, frameIndex, isKeyFrame);
+    // =========== 阶段2：逐帧绘制 ===========
+    const frameInterval = 1 / config.fps;
+    // 用精确帧数控制循环，避免浮点累加漂移导致多编码帧
+    const totalFrames = Math.round(totalDuration * config.fps);
 
-    const elapsed = currentExportTime - trimStart;
-    const progress = 0.45 + Math.min(0.5, (elapsed / totalDuration) * 0.5);
 
     report({
       phase: "encoding",
-      progress,
-      message: `编码调试视频 ${(progress * 100).toFixed(1)}%`,
-      currentTime: elapsed,
+      progress: 0.45,
+      message: "正在编码调试视频...",
+      currentTime: 0,
       duration: totalDuration,
     });
 
-    if (frameIndex % 3 === 0) await sleep(0);
+    let kfIdx = 0;
+
+    for (let frameIndex = 0; frameIndex < totalFrames; frameIndex++) {
+      abortSignal?.throwIfAborted();
+      encoder.checkError();
+
+      // 通过帧序号精确计算当前时间点，避免浮点累加误差
+      const currentExportTime = trimStart + frameIndex * frameInterval;
+
+      await seekVideoFrame(video, currentExportTime, abortSignal);
+
+      // 查找最近的关键帧并插值
+      while (kfIdx < debugKeyframes.length - 2 && debugKeyframes[kfIdx + 1].time < currentExportTime) {
+        kfIdx++;
+      }
+
+      let vp: Viewport;
+      let person: DebugKeyframe["person"];
+
+      if (kfIdx >= debugKeyframes.length - 1) {
+        vp = debugKeyframes[debugKeyframes.length - 1].viewport;
+        person = debugKeyframes[debugKeyframes.length - 1].person;
+      } else {
+        const kf0 = debugKeyframes[kfIdx];
+        const kf1 = debugKeyframes[kfIdx + 1];
+        const segDuration = kf1.time - kf0.time;
+        const t = segDuration > 0 ? (currentExportTime - kf0.time) / segDuration : 0;
+        const clampedT = Math.max(0, Math.min(1, t));
+        vp = lerpViewport(kf0.viewport, kf1.viewport, clampedT);
+        // person 取最近的关键帧
+        person = clampedT < 0.5 ? kf0.person : kf1.person;
+      }
+
+      // 清空画布（黑色背景）
+      ctx.fillStyle = "#000000";
+      ctx.fillRect(0, 0, finalW, finalH);
+
+      const sx = vp.x * vw;
+      const sy = vp.y * vh;
+      const sw = vp.width * vw;
+      const sh = vp.height * vh;
+
+      if (isLandscape) {
+        // ===== 横屏：上下排列 =====
+        // ---- 上方：裁剪后的输出画面 ----
+        ctx.drawImage(video, sx, sy, sw, sh, 0, 0, topW, topH);
+
+        // "OUTPUT" 标签
+        ctx.fillStyle = "rgba(0,0,0,0.5)";
+        ctx.fillRect(0, 0, Math.round(topW * 0.12), Math.round(topH * 0.05));
+        ctx.fillStyle = "#00ff88";
+        ctx.font = `bold ${Math.round(topH * 0.03)}px monospace`;
+        ctx.fillText("OUTPUT", 6, Math.round(topH * 0.035));
+
+        // ---- 中间分割线 ----
+        ctx.fillStyle = "#333333";
+        ctx.fillRect(0, topH, finalW, gap);
+
+        // ---- 下方：全景调试视图 ----
+        const debugY = topH + gap;
+        ctx.drawImage(video, 0, 0, vw, vh, 0, debugY, bottomW, bottomH);
+
+        // 在下方画布区域绘制调试叠加层
+        ctx.save();
+        ctx.translate(0, debugY);
+        drawDebugOverlay(ctx, bottomW, bottomH, vw, vh, vp, person, currentExportTime);
+        ctx.restore();
+
+        // "DEBUG" 标签
+        ctx.fillStyle = "rgba(0,0,0,0.5)";
+        ctx.fillRect(0, debugY, Math.round(bottomW * 0.1), Math.round(bottomH * 0.06));
+        ctx.fillStyle = "#ff6600";
+        ctx.font = `bold ${Math.round(bottomH * 0.035)}px monospace`;
+        ctx.fillText("DEBUG", 6, debugY + Math.round(bottomH * 0.04));
+      } else {
+        // ===== 竖屏：左右并排 =====
+        // ---- 左侧：裁剪后的输出画面 ----
+        ctx.drawImage(video, sx, sy, sw, sh, 0, 0, topW, topH);
+
+        // "OUTPUT" 标签
+        ctx.fillStyle = "rgba(0,0,0,0.5)";
+        ctx.fillRect(0, 0, Math.round(topW * 0.18), Math.round(topH * 0.035));
+        ctx.fillStyle = "#00ff88";
+        ctx.font = `bold ${Math.round(topH * 0.022)}px monospace`;
+        ctx.fillText("OUTPUT", 6, Math.round(topH * 0.025));
+
+        // ---- 中间分割线 ----
+        ctx.fillStyle = "#333333";
+        ctx.fillRect(topW, 0, gap, finalH);
+
+        // ---- 右侧：全景调试视图 ----
+        const rightX = topW + gap;
+        ctx.drawImage(video, 0, 0, vw, vh, rightX, 0, bottomW, bottomH);
+
+        // 在右侧画布区域绘制调试叠加层
+        ctx.save();
+        ctx.translate(rightX, 0);
+        drawDebugOverlay(ctx, bottomW, bottomH, vw, vh, vp, person, currentExportTime);
+        ctx.restore();
+
+        // "DEBUG" 标签
+        ctx.fillStyle = "rgba(0,0,0,0.5)";
+        ctx.fillRect(rightX, 0, Math.round(bottomW * 0.15), Math.round(bottomH * 0.035));
+        ctx.fillStyle = "#ff6600";
+        ctx.font = `bold ${Math.round(bottomH * 0.022)}px monospace`;
+        ctx.fillText("DEBUG", rightX + 6, Math.round(bottomH * 0.025));
+      }
+
+      // 通过编码后端编码当前帧
+      const isKeyFrame = frameIndex % (config.fps * 2) === 0;
+      encoder.encodeFrame(canvas, frameIndex, isKeyFrame);
+
+      const elapsed = currentExportTime - trimStart;
+      const progress = 0.45 + Math.min(0.5, (elapsed / totalDuration) * 0.5);
+
+      report({
+        phase: "encoding",
+        progress,
+        message: `编码调试视频 ${(progress * 100).toFixed(1)}%`,
+        currentTime: elapsed,
+        duration: totalDuration,
+      });
+
+      if (frameIndex % 3 === 0) await sleep(0);
+    }
+
+    // 完成
+    report({
+      phase: "finalizing",
+      progress: 0.95,
+      message: "正在合成调试视频文件...",
+    });
+
+    abortSignal?.throwIfAborted();
+    const url = await encoder.finalize(abortSignal);
+
+    report({
+      phase: "done",
+      progress: 1,
+      message: "调试视频导出完成！",
+    });
+
+    return url;
+  } finally {
+    abortSignal?.removeEventListener("abort", closeEncoder);
+    closeEncoder();
   }
-
-  // 完成
-  report({
-    phase: "finalizing",
-    progress: 0.95,
-    message: "正在合成调试视频文件...",
-  });
-
-  const url = await encoder.finalize();
-
-  report({
-    phase: "done",
-    progress: 1,
-    message: "调试视频导出完成！",
-  });
-
-  return url;
-}
-
-function waitForSeek(video: HTMLVideoElement): Promise<void> {
-  return new Promise((resolve) => {
-    if (!video.seeking) {
-      resolve();
-      return;
-    }
-    const onSeeked = () => {
-      video.removeEventListener("seeked", onSeeked);
-      resolve();
-    };
-    video.addEventListener("seeked", onSeeked);
-  });
-}
-
-function waitForFrame(video: HTMLVideoElement): Promise<void> {
-  return new Promise((resolve) => {
-    if (video.readyState >= 2) {
-      resolve();
-      return;
-    }
-    const onCanPlay = () => {
-      video.removeEventListener("canplay", onCanPlay);
-      resolve();
-    };
-    video.addEventListener("canplay", onCanPlay);
-  });
 }
 
 function sleep(ms: number): Promise<void> {

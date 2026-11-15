@@ -13,8 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "攀岩视频智能跟踪 - Climbing Tracker",
-  description: "AI 驱动的纯前端攀岩视频人体跟踪工具，智能裁剪画面让攀岩者居中",
+  title: "攀岩剪辑 · Climbing Tracker",
+  description: "在浏览器里跟踪攀岩者、裁切片段和导出视频。",
 };
 
 export default function RootLayout({
@@ -24,7 +24,7 @@ export default function RootLayout({
 }>) {
   return (
     <html
-      lang="en"
+      lang="zh-Hans"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">{children}</body>

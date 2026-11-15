@@ -26,6 +26,7 @@ interface PoseDetector {
     video: HTMLVideoElement,
     config?: Record<string, unknown>
   ): Promise<PoseResult[]>;
+  reset(): void;
   dispose(): void;
 }
 
@@ -78,6 +79,7 @@ export class ClimbingTrackerEngine {
   }
 
   reset(): void {
+    this.detector?.reset();
     this.lastValidPerson = null;
     this.smoothedViewport = null;
     this.viewportVelocity = { x: 0, y: 0, width: 0, height: 0 };
@@ -107,7 +109,7 @@ export class ClimbingTrackerEngine {
     const vh = video.videoHeight;
 
     const person = this.selectClimber(poses, vw, vh);
-    const targetViewport = this.computeTargetViewport(person, vw, vh);
+    const targetViewport = this.computeTargetViewport(person);
     const smoothed = this.smoothViewport(targetViewport);
 
     return { viewport: smoothed, person };
@@ -141,7 +143,7 @@ export class ClimbingTrackerEngine {
 
     const person = this.selectClimber(poses, vw, vh);
     // 直接返回原始目标视口，不做 EMA 平滑
-    const rawViewport = this.computeTargetViewport(person, vw, vh);
+    const rawViewport = this.computeTargetViewport(person);
 
     return { viewport: rawViewport, person };
   }
@@ -283,9 +285,7 @@ export class ClimbingTrackerEngine {
   }
 
   private computeTargetViewport(
-    person: TrackedPerson | null,
-    vw: number,
-    vh: number
+    person: TrackedPerson | null
   ): Viewport {
     if (!person) {
       // 检测中断时：优先保持最后有效视口不动，避免视口突然放大
@@ -306,7 +306,6 @@ export class ClimbingTrackerEngine {
     const personCx = bbox.x + bbox.width / 2;
     const personCy = bbox.y + bbox.height / 2;
     const personH = bbox.height;
-    const sourceAr = vw / vh; // 源视频宽高比
 
     // ===== 人体高度 EMA 平滑 =====
     // AI bbox 检测帧间波动较大，直接用 personH 算视口会导致视口剧烈缩放
@@ -356,26 +355,8 @@ export class ClimbingTrackerEngine {
     cropH = Math.max(cropH, this.config.minCropSize);
     cropH = Math.min(cropH, 1);
 
-    // 保持源视频原始宽高比：cropW / cropH = sourceAr（归一化空间中）
-    // 注意：在归一化空间中 width 对应实际 vw 像素，height 对应 vh 像素
-    // 实际像素裁剪宽高比 = (cropW * vw) / (cropH * vh) = cropW * sourceAr / cropH
-    // 要保持 sourceAr，需要 cropW * vw / (cropH * vh) = vw / vh
-    // 即 cropW / cropH = 1（在归一化空间中等宽等高比例）
-    // 不对 — 归一化空间中 cropW=1 对应 vw 像素，cropH=1 对应 vh 像素
-    // 实际裁剪区域的像素宽高比 = (cropW * vw) / (cropH * vh)
-    // 要等于 sourceAr = vw / vh → cropW = cropH
-    let cropW = cropH;
-
-    // 如果宽度溢出，限制宽度并调整高度
-    if (cropW > 1) {
-      cropW = 1;
-      cropH = 1; // 保持比例 cropW = cropH
-      cropH = Math.min(cropH, 1);
-    }
-    if (cropH > 1) {
-      cropH = 1;
-      cropW = 1;
-    }
+    // 横纵方向按源视频尺寸的相同比例裁切，以保持宽高比。
+    const cropW = cropH;
 
     // 定位：以人体为中心，verticalCenterBias 控制垂直偏移
     const bias = this.config.verticalCenterBias;
